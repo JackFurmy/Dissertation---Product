@@ -1,0 +1,22 @@
+matplotlib==3.8.4\
+numpy==1.26.4\
+pandas==2.2.1\
+scikit-learn==1.4.2\
+xgboost==2.0.3\
+river==0.22.0\
+joblib==1.4.2\
+requests==2.32.3\
+\
+# -------- Firebase / auth ----------\
+firebase-admin==6.3.0          
+Pyrebase4==5.7.1\
+google-api-python-client==2.166.0\
+google-cloud-firestore==2.20.1\
+google-auth==2.38.0\
+google-auth-httplib2==0.2.0\
+google-auth-oauthlib==1.2.0\
+httplib2==0.22.0\
+\
+# -------- build tool ----------\
+pyinstaller==6.13.0\
+}

@@ -1,0 +1,17 @@
+fastapi==0.110.2
+uvicorn==0.29.0
+pydantic==2.7.1
+
+# ML stack
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.6.0
+xgboost==2.0.3
+river==0.21.0
+joblib==1.4.2
+requests==2.32.3
+
+# Firebase Admin SDK
+firebase-admin==6.3.0
+google-cloud-firestore==2.20.1
+google-auth==2.38.0
