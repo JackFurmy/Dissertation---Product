@@ -1,0 +1,337 @@
+import os
+import io
+import requests
+import numpy as np
+import pandas as pd
+import joblib
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.naive_bayes import GaussianNB
+from sklearn.linear_model import SGDClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
+
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    roc_auc_score,
+    average_precision_score,
+    f1_score,
+    accuracy_score
+)
+from sklearn.feature_selection import mutual_info_classif
+import matplotlib.pyplot as plt
+
+UNSW_NB15_FIREBASE_URL = (
+    ""
+)
+LABEL_COL = "label"
+
+LEAKY_COLUMNS = []
+
+PARTIAL_FIT_MODELS = ["SGD", "NB"]
+BATCH_SIZE = 100_000
+N_EPOCHS   = 1
+
+SAVE_BASELINE = True
+BASELINE_MODEL_PATH = (
+    "cybersecurity_game/game/game/models/models/unsw_nb15_baseline.pkl"
+)
+
+MI_FIG_DIR  = "cybersecurity_game/game/game/mi figure"
+MI_FIG_NAME = "unsw_nb15_mi.png"
+
+def load_data_via_requests(firebase_url, label_col=LABEL_COL, drop_leak=LEAKY_COLUMNS):
+    print(f"[INFO] Downloading UNSW-NB15 CSV from {firebase_url} using requests...")
+    resp = requests.get(firebase_url, verify=True)
+    resp.raise_for_status()
+
+    filelike = io.StringIO(resp.text)
+    df = pd.read_csv(filelike, low_memory=True)
+    print(f"[INFO] Loaded data: {df.shape[0]} rows, {df.shape[1]} columns.")
+
+    for c in drop_leak:
+        if c in df.columns:
+            df.drop(columns=[c], inplace=True, errors='ignore')
+
+    if label_col not in df.columns:
+        print(f"[ERROR] Label col '{label_col}' not found. Exiting.")
+        return None, None
+
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.dropna(inplace=True)
+
+    before = len(df)
+    df.drop_duplicates(inplace=True)
+    after = len(df)
+    print(f"[INFO] Removed {before - after} duplicates => {after} rows remain.")
+
+    df[label_col] = pd.to_numeric(df[label_col], errors='coerce')
+    df.dropna(subset=[label_col], inplace=True)
+
+    X = df.drop(columns=[label_col], errors='ignore')
+    y = df[label_col]
+
+    print(f"[INFO] Final shape: X={X.shape}, y={y.shape}")
+    return X, y
+
+def remove_correlated_features(X, threshold=0.95):
+    if X.shape[1] < 2:
+        return X
+
+    corr_matrix = X.corr().abs()
+    upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    high_corr_feats = [col for col in upper_tri.columns if any(upper_tri[col] > threshold)]
+    if high_corr_feats:
+        print(f"[INFO] Dropping highly correlated features: {high_corr_feats}")
+        X.drop(columns=high_corr_feats, inplace=True, errors='ignore')
+    return X
+
+def plot_mutual_info(X, y):
+    X_num = X.select_dtypes(include=[np.number])
+    if X_num.empty:
+        print("[WARN] No numeric columns => skipping MI.")
+        return None
+
+    print(f"[INFO] Computing mutual info on {X_num.shape[1]} numeric columns...")
+    mi_scores = mutual_info_classif(X_num, y, discrete_features='auto', random_state=42)
+    mi_df = pd.DataFrame({
+        'feature': X_num.columns,
+        'mi_score': mi_scores
+    })
+    mi_df.sort_values(by='mi_score', ascending=False, inplace=True)
+
+    plt.figure(figsize=(10,5))
+    plt.bar(mi_df['feature'], mi_df['mi_score'], color='skyblue')
+    plt.xticks(rotation=90)
+    plt.ylabel("Mutual Info w.r.t. label")
+    plt.title("UNSW-NB15: Feature 'Leakage' Score (MI)")
+    plt.tight_layout()
+
+    os.makedirs(MI_FIG_DIR, exist_ok=True)
+    out_path = os.path.join(MI_FIG_DIR, MI_FIG_NAME)
+    plt.savefig(out_path)
+    print(f"[INFO] MI figure saved => {out_path}")
+
+    plt.show()
+    return mi_df
+
+def compute_metrics_binary(y_true, y_pred, y_proba=None):
+    acc = accuracy_score(y_true, y_pred)
+    macro_f1 = f1_score(y_true, y_pred, average='macro', labels=[0,1])
+
+    print("\nClassification Report (Labels=[0,1]):")
+    print(classification_report(y_true, y_pred, zero_division=0, labels=[0,1]))
+    print(f"Accuracy:  {acc:.4f}")
+    print(f"Macro-F1:  {macro_f1:.4f}")
+
+    if (y_proba is not None) and (y_proba.shape[1] == 2):
+        y_prob1 = y_proba[:,1]
+        rocAUC  = roc_auc_score(y_true, y_prob1)
+        prAUC   = average_precision_score(y_true, y_prob1)
+        print(f"ROC AUC:   {rocAUC:.4f}")
+        print(f"PR AUC :   {prAUC:.4f}")
+
+    y_true_bin = np.where(y_true==0, 0, 1)
+    y_pred_bin = np.where(y_pred==0, 0, 1)
+    cm_bin = confusion_matrix(y_true_bin, y_pred_bin, labels=[0,1])
+    tn, fp, fn, tp = cm_bin.ravel()
+    tnr = tn/(tn+fp) if (tn+fp)>0 else 0
+    far = fp/(tn+fp) if (tn+fp)>0 else 0
+    print(f"TNR (Benign): {tnr:.4f}")
+    print(f"FAR:         {far:.4f}")
+
+    cm_full = confusion_matrix(y_true, y_pred, labels=[0,1])
+    print("Full Confusion Matrix (0,1):\n", cm_full)
+    print("--------------------------------------------------")
+
+    return acc, macro_f1
+
+def gather_model_metrics(clf, X_val_sc, y_val_np):
+    y_pred = clf.predict(X_val_sc)
+    acc = accuracy_score(y_val_np, y_pred)
+    macro_f1 = f1_score(y_val_np, y_pred, average='macro', labels=[0,1])
+
+    rocAUC, prAUC = None, None
+    if hasattr(clf, 'predict_proba'):
+        y_proba = clf.predict_proba(X_val_sc)
+        if y_proba.shape[1] == 2:
+            y_prob1 = y_proba[:,1]
+            rocAUC  = roc_auc_score(y_val_np, y_prob1)
+            prAUC   = average_precision_score(y_val_np, y_prob1)
+
+    y_true_bin = np.where(y_val_np==0, 0, 1)
+    y_pred_bin = np.where(y_pred==0, 0, 1)
+    cm_bin = confusion_matrix(y_true_bin, y_pred_bin, labels=[0,1])
+    tn, fp, fn, tp = cm_bin.ravel()
+    tnr = tn/(tn+fp) if (tn+fp)>0 else 0
+    far = fp/(tn+fp) if (tn+fp)>0 else 0
+
+    cm_full = confusion_matrix(y_val_np, y_pred, labels=[0,1])
+
+    return {
+        "accuracy": float(acc),
+        "macro_f1": float(macro_f1),
+        "roc_auc":  float(rocAUC) if rocAUC else None,
+        "pr_auc":   float(prAUC)  if prAUC  else None,
+        "tnr":      float(tnr),
+        "far":      float(far),
+        "conf_matrix": cm_full.tolist()
+    }
+
+def train_and_evaluate_all_models(
+    X_train, y_train,
+    X_val,   y_val,
+    partial_fit_models=["SGD", "NB"],
+    batch_size=100_000,
+    n_epochs=1
+):
+    models = {
+        "SGD": SGDClassifier(loss='hinge', random_state=42),
+        "NB" : GaussianNB(),
+        "DT" : DecisionTreeClassifier(max_depth=5, min_samples_leaf=50, random_state=42),
+        "RF" : RandomForestClassifier(
+            n_estimators=30,
+            max_depth=5,
+            min_samples_leaf=50,
+            random_state=42
+        ),
+        "XGB": xgb.XGBClassifier(
+            random_state=42,
+            eval_metric='mlogloss',
+            max_depth=5,
+            min_child_weight=200,
+            gamma=10,
+            subsample=0.8,
+            colsample_bytree=0.8
+        )
+    }
+
+    scaler = StandardScaler()
+    X_train_np = X_train.values
+    y_train_np = y_train.values
+    X_val_np   = X_val.values
+    y_val_np   = y_val.values
+
+    scaler.fit(X_train_np)
+    X_train_sc = scaler.transform(X_train_np)
+    X_val_sc   = scaler.transform(X_val_np)
+
+    classes   = np.array([0,1])
+    n_samples = len(X_train_sc)
+
+    results_dict = {}
+
+    for name, clf in models.items():
+        print(f"\n=== Training {name} ===")
+        if name in partial_fit_models:
+            for epoch in range(n_epochs):
+                print(f"[INFO] {name}: Starting epoch {epoch+1}/{n_epochs}")
+                idx = np.arange(n_samples)
+                np.random.shuffle(idx)
+
+                start=0
+                while start < n_samples:
+                    end = min(start+batch_size, n_samples)
+                    batch_idx = idx[start:end]
+                    X_batch   = X_train_sc[batch_idx]
+                    y_batch   = y_train_np[batch_idx]
+
+                    if hasattr(clf, 'partial_fit'):
+                        clf.partial_fit(X_batch, y_batch, classes=classes)
+                    else:
+                        clf.fit(X_batch, y_batch)
+                    start = end
+
+                y_val_pred = clf.predict(X_val_sc)
+                acc = accuracy_score(y_val_np, y_val_pred)
+                f1m= f1_score(y_val_np, y_val_pred, average='macro', labels=[0,1])
+                print(f"[Epoch {epoch+1}] {name} => Accuracy: {acc:.4f}, F1: {f1m:.4f}")
+        else:
+            clf.fit(X_train_sc, y_train_np)
+
+        y_pred  = clf.predict(X_val_sc)
+        y_proba = clf.predict_proba(X_val_sc) if hasattr(clf, 'predict_proba') else None
+        acc, mf1= compute_metrics_binary(y_val_np, y_pred, y_proba)
+
+        scoreboard = gather_model_metrics(clf, X_val_sc, y_val_np)
+        results_dict[name] = {
+            "model":  clf,
+            "scaler": scaler,
+            "metrics": scoreboard
+        }
+
+    return results_dict
+
+def batch_retraining_demo():
+    print("[INFO] batch_retraining_demo() not used in this remote example.")
+
+def main():
+    X, y = load_data_via_requests(UNSW_NB15_FIREBASE_URL)
+    if X is None or y is None:
+        print("[ERROR] Could not load UNSW-NB15 dataset.")
+        return
+
+    X = remove_correlated_features(X, threshold=0.95)
+
+    mi_df = plot_mutual_info(X, y)
+    if mi_df is not None:
+        print("\nTop 15 columns by MI:\n", mi_df.head(15))
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y,
+        test_size=0.2,
+        stratify=y,
+        random_state=42
+    )
+    print(f"[INFO] Stratified => Train={X_train.shape[0]}, Val={X_val.shape[0]}")
+
+    results_dict = train_and_evaluate_all_models(
+        X_train, y_train,
+        X_val,   y_val,
+        partial_fit_models=PARTIAL_FIT_MODELS,
+        batch_size=BATCH_SIZE,
+        n_epochs=N_EPOCHS
+    )
+    if not results_dict:
+        print("[ERROR] No models were trained => cannot save baseline.")
+        return
+
+    best_name = None
+    best_f1   = -1.0
+    for m_name, info in results_dict.items():
+        scoreboard = info["metrics"]
+        macro_f1   = scoreboard.get("macro_f1", 0.0)
+        if macro_f1 > best_f1:
+            best_f1 = macro_f1
+            best_name = m_name
+
+    if not best_name:
+        print("[ERROR] Could not find a best model => scoreboard empty.")
+        return
+
+    print(f"\n[INFO] Best model => {best_name}, Macro-F1={best_f1:.4f}")
+    best_model_info = results_dict[best_name]
+    best_scoreboard = best_model_info["metrics"]
+    baseline_acc    = best_scoreboard["accuracy"]
+
+    data_dict = {
+        "models":       results_dict,    
+        "best_name":    best_name,
+        "baseline_acc": baseline_acc,      
+        "columns":      list(X_train.columns),
+        "metrics":      best_scoreboard,
+        "dataset_url":  UNSW_NB15_FIREBASE_URL
+    }
+
+    if SAVE_BASELINE:
+        os.makedirs(os.path.dirname(BASELINE_MODEL_PATH), exist_ok=True)
+        joblib.dump(data_dict, BASELINE_MODEL_PATH)
+        print(f"[INFO] Dictionary-based baseline => {BASELINE_MODEL_PATH}")
+
+
+if __name__ == "__main__":
+    main()
+    # batch_retraining_demo()
